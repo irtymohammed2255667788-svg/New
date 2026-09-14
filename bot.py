@@ -26,10 +26,16 @@ except ImportError:
 pyrogram_utils.MIN_CHANNEL_ID = -10**15
 
 # --- Settings ---
-BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
-OWNER_ID_RAW = (os.environ.get("OWNER_ID") or "").strip()
-API_ID_RAW = (os.environ.get("API_ID") or "").strip()
-API_HASH = (os.environ.get("API_HASH") or "").strip()
+def read_env(name):
+    value = (os.environ.get(name) or "").strip()
+    # Safe diagnostics: never print secrets or their values.
+    print(f"[config] {name}: {'present' if value else 'EMPTY'}")
+    return value
+
+BOT_TOKEN = read_env("BOT_TOKEN")
+OWNER_ID_RAW = read_env("OWNER_ID")
+API_ID_RAW = read_env("API_ID")
+API_HASH = read_env("API_HASH")
 # مراقبة رسائل الحسابات مفعّلة افتراضيًا حتى يلتقط البوت روابط القنوات
 # التي ترسلها البوتات داخل الكروبات والقنوات. يمكن تعطيلها صراحةً من Railway.
 ENABLE_USERBOT_MONITORING = (
