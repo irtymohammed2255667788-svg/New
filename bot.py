@@ -1,6 +1,8 @@
 
 import os
 import asyncio
+import base64
+import struct
 import copy
 import json
 import random
@@ -2439,9 +2441,40 @@ def remove_indexed_account_state(state, removed_index, one_based=True):
 
 
 
+def _normalize_session_string(session_str):
+    """تحويل Telethon StringSession إلى تنسيق Pyrogram عند استيراد جلسات Strat."""
+    raw = str(session_str or "").strip()
+    if not raw or not raw.startswith("1"):
+        return raw
+
+    try:
+        encoded = raw[1:]
+        payload = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        if len(payload) == 263:
+            dc_id, _server_address, _port, auth_key = struct.unpack(">B4sH256s", payload)
+        elif len(payload) == 275:
+            dc_id, _server_address, _port, auth_key = struct.unpack(">B16sH256s", payload)
+        else:
+            return raw
+
+        pyrogram_payload = struct.pack(
+            ">BI?256sQ?",
+            dc_id,
+            API_ID,
+            False,
+            auth_key,
+            0,
+            False,
+        )
+        return base64.urlsafe_b64encode(pyrogram_payload).decode("ascii").rstrip("=")
+    except Exception:
+        # اترك صيغ Pyrogram أو الجلسات غير الصالحة لتظهر رسالة الخطأ الأصلية.
+        return raw
+
+
 async def _recover_session_string(session_str, db, user_id_str):
     """التحقق من Session String وحفظه للنصوص وملفات JSON وZIP."""
-    session_str = str(session_str or "").strip()
+    session_str = _normalize_session_string(session_str)
     if not session_str:
         return "❌ ملف الجلسة لا يحتوي Session String صالحاً."
     try:
