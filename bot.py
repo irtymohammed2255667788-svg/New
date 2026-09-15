@@ -10,7 +10,7 @@ import re
 import tempfile
 from contextvars import ContextVar
 from datetime import datetime, timedelta
-from pyrogram import Client, filters, idle, utils as pyrogram_utils
+from pyrogram import Client, filters, idle, raw, utils as pyrogram_utils
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import (
     SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, 
@@ -998,7 +998,12 @@ async def get_account_info(session_str, index):
     if cache_key in cache:
         return cache[cache_key]
     try:
-        temp_client = Client(f"info_session_{current_profile_id()}_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+        temp_client = Client(
+            f"info_session_{current_profile_id()}_{index}",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=_normalize_session_string(session_str),
+        )
         await temp_client.connect()
         me = await temp_client.get_me()
         info = {
@@ -1118,8 +1123,13 @@ async def auto_leave_channels():
                 for idx, session_str in enumerate(db["accounts"]):
                     user_app = None
                     try:
-                        user_app = Client(f"leave_session_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
-                        await user_app.start()
+                        user_app = Client(
+                            f"leave_session_{idx}",
+                            api_id=API_ID,
+                            api_hash=API_HASH,
+                            session_string=_normalize_session_string(session_str),
+                        )
+                        await _start_user_client(user_app)
                         await user_app.leave_chat(get_group_chat_target(channel))
                         print(f"🚪 Acc {idx+1} left {channel}")
                     except Exception as e:
@@ -1167,9 +1177,9 @@ async def join_channel_for_account(session_str, account_index, channel):
             f"join_session_{current_profile_id()}_{account_index}",
             api_id=API_ID,
             api_hash=API_HASH,
-            session_string=session_str,
+            session_string=_normalize_session_string(session_str),
         )
-        await user_app.start()
+        await _start_user_client(user_app)
         chat_info = None
         try:
             chat_info = await user_app.get_chat(clean_link)
@@ -1410,9 +1420,13 @@ async def auto_posting_loop():
     try:
         for idx, session_str in enumerate(db["accounts"]):
             try:
-                client = Client(f"active_session_{current_profile_id()}_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
-                await client.start()
-                me = await client.get_me()
+                client = Client(
+                    f"active_session_{current_profile_id()}_{idx}",
+                    api_id=API_ID,
+                    api_hash=API_HASH,
+                    session_string=_normalize_session_string(session_str),
+                )
+                me = await _start_user_client(client)
                 active_clients.append(client)
                 account_info.append({
                     "index": idx,
@@ -1725,7 +1739,12 @@ async def forward_group_message_to_owner(message, source_account=None):
 
 async def start_userbot_monitor(session_str, index):
     """تشغيل عميل لكل حساب لمراقبة الروابط والرسائل في الكروبات."""
-    client = Client(f"userbot_{current_profile_id()}_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+    client = Client(
+        f"userbot_{current_profile_id()}_{index}",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        session_string=_normalize_session_string(session_str),
+    )
 
     # لا نراقب رسائل الأعضاء العادية: بوتات داخل الكروبات أو منشورات القنوات فقط.
     @client.on_message(filters.incoming & AUTOMATED_OR_CHANNEL_FILTER)
@@ -1741,7 +1760,7 @@ async def start_userbot_monitor(session_str, index):
             print(f"⚠️ Userbot {index+1} skipped an update: {error}")
 
     try:
-        await client.start()
+        await _start_user_client(client)
         print(f"✅ Userbot {index+1} started monitoring groups")
         while True:
             await asyncio.sleep(3600)
@@ -1860,8 +1879,13 @@ async def handle_owner_commands(client: Client, message: Message):
                     account_index = account_number - 1
                     if account_index < len(db["accounts"]):
                         session_str = db["accounts"][account_index]
-                        user_client = Client(f"reply_client_{current_profile_id()}_{account_index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
-                        await user_client.start()
+                        user_client = Client(
+                            f"reply_client_{current_profile_id()}_{account_index}",
+                            api_id=API_ID,
+                            api_hash=API_HASH,
+                            session_string=_normalize_session_string(session_str),
+                        )
+                        await _start_user_client(user_client)
                         await user_client.send_message(chat_id, reply_text, reply_to_message_id=message_id)
                         await user_client.stop()
                         await message.reply_text(f"✅ تم إرسال الرد من الحساب {account_number}")
@@ -2472,6 +2496,38 @@ def _normalize_session_string(session_str):
         return raw
 
 
+async def _start_user_client(client):
+    """تشغيل جلسة مستخدم دون السماح لـ Pyrogram بفتح إدخال تفاعلي."""
+    try:
+        is_authorized = await client.connect()
+        if not is_authorized:
+            # جلسات Telethon المحولة لا تحتوي user_id؛ auth_key ما زال صالحًا
+            # لكن Client.start() سيحاول طلب رقم الهاتف من stdin، وهذا يؤدي إلى
+            # EOF داخل Railway. نستخرج الهوية من Telegram ثم نكمل التهيئة يدويًا.
+            try:
+                me = await client.get_me()
+            except Exception as error:
+                raise RuntimeError(
+                    "Session is not authorized or has expired; re-import the session"
+                ) from error
+            await client.storage.user_id(me.id)
+            await client.storage.is_bot(bool(me.is_bot))
+
+        await client.invoke(raw.functions.updates.GetState())
+        client.me = await client.get_me()
+        await client.initialize()
+        return client.me
+    except Exception:
+        if client.is_connected:
+            try:
+                if client.is_initialized:
+                    await client.terminate()
+                await client.disconnect()
+            except Exception:
+                pass
+        raise
+
+
 async def _recover_session_string(session_str, db, user_id_str):
     """التحقق من Session String وحفظه للنصوص وملفات JSON وZIP."""
     session_str = _normalize_session_string(session_str)
@@ -2482,10 +2538,15 @@ async def _recover_session_string(session_str, db, user_id_str):
             f"recover_session_{current_profile_id()}_{OWNER_ID}",
             api_id=API_ID,
             api_hash=API_HASH,
-            session_string=session_str,
+            session_string=_normalize_session_string(session_str),
         )
         await temp_client.connect()
         me = await temp_client.get_me()
+        # احفظ user_id/is_bot داخل صيغة Pyrogram حتى لا تعود الجلسة إلى
+        # وضع التفويض التفاعلي عند إعادة تشغيل الخدمة.
+        await temp_client.storage.user_id(me.id)
+        await temp_client.storage.is_bot(bool(me.is_bot))
+        session_str = await temp_client.export_session_string()
         await temp_client.disconnect()
         existing_owner = find_account_owner_by_session(session_str)
         if not existing_owner and me.phone_number:
@@ -2784,9 +2845,9 @@ async def handle_callback(client: Client, callback_query):
                     f"logout_session_{profile_id}_{index}",
                     api_id=API_ID,
                     api_hash=API_HASH,
-                    session_string=session_str,
+                    session_string=_normalize_session_string(session_str),
                 )
-                await temp_client.start()
+                await _start_user_client(temp_client)
                 await temp_client.log_out()
             except Exception as error:
                 logout_error = error
