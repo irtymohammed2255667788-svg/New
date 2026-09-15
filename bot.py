@@ -615,6 +615,7 @@ def clean_group_link(link):
     link = re.sub(r"(?i)^https?://www\.t\.me/", "https://t.me/", link)
     link = re.sub(r"(?i)^www\.t\.me/", "t.me/", link)
     link = re.sub(r"(?i)^tg://join\?invite=([\w-]+)$", r"https://t.me/+\1", link)
+    link = re.sub(r"[?#].*$", "", link)
     # A t.me/c/<channel_id>/<message_id> URL identifies a private channel.
     # Convert it to Telegram's peer form before attempting the join.
     private_message_link = re.match(
@@ -624,7 +625,6 @@ def clean_group_link(link):
     )
     if private_message_link:
         return f"-100{private_message_link.group(1)}"
-    link = re.sub(r"[?#].*$", "", link)
     if re.fullmatch(r"-?\d+", link):
         return link
     if link.startswith(("https://t.me/", "http://t.me/", "t.me/")):
@@ -658,10 +658,16 @@ def get_group_chat_target(group):
 
 
 def is_private_invite_link(value):
+    normalized = str(value or "").strip().rstrip(".,;:!?)]}")
+    normalized = re.sub(r"(?i)^https?://telegram\.me/", "https://t.me/", normalized)
+    normalized = re.sub(r"(?i)^telegram\.me/", "t.me/", normalized)
+    normalized = re.sub(r"(?i)^https?://www\.t\.me/", "https://t.me/", normalized)
+    normalized = re.sub(r"(?i)^www\.t\.me/", "t.me/", normalized)
+    normalized = re.sub(r"[?#].*$", "", normalized)
     return bool(
         re.fullmatch(
             r"(?:https?://)?t\.me/(?:\+[\w-]+|joinchat/[\w-]+)",
-            str(value or ""),
+            normalized,
             flags=re.IGNORECASE,
         )
     )
@@ -1169,8 +1175,10 @@ async def resolve_chat_for_join(client, channel):
     """البحث عن الدردشة قبل الانضمام، مع دعم الرابط والمعرف واليوزر."""
     raw_value = str(channel or "").strip()
     clean_link = clean_group_link(raw_value)
+    username_target = clean_link if clean_link.startswith("@") else None
     candidates = []
     for candidate in (
+        username_target,
         raw_value,
         clean_link,
         clean_link[1:] if clean_link.startswith("@") else None,
@@ -1219,28 +1227,55 @@ async def join_channel_for_account(session_str, account_index, channel):
         if chat_info and getattr(chat_info, "id", None) is not None:
             db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
 
-        try:
-            # استخدم الرابط الأصلي للدعوات الخاصة، والمعرف الذي تم البحث عنه
-            # للروابط العامة أو @username عندما يكون الرابط نفسه محجوبًا.
-            if is_private_invite_link(clean_link):
-                join_target = clean_link
-            elif chat_info and getattr(chat_info, "id", None) is not None:
-                join_target = int(chat_info.id)
-            else:
-                join_target = clean_link
-            joined_chat = await user_app.join_chat(join_target)
-            joined = True
-            print(f"✅ Acc {account_index + 1} joined {clean_link}")
-            if getattr(joined_chat, "id", None) is not None:
-                db.setdefault("group_chat_ids", {})[clean_link] = str(joined_chat.id)
-        except Exception as error:
-            error_text = str(error).upper()
-            if "ALREADY_PARTICIPANT" in error_text or "USER_ALREADY_PARTICIPANT" in error_text:
+        # استخدم رابط الدعوة الخاص كما هو. للقنوات العامة جرّب اليوزر أولًا؛
+        # الاعتماد على ID فقط قد يفشل لأن جلسة الحساب لا تملك الـ peer محليًا.
+        join_targets = []
+        if is_private_invite_link(clean_link):
+            join_targets.append(clean_link)
+        else:
+            chat_username = getattr(chat_info, "username", None) if chat_info else None
+            if chat_username:
+                join_targets.append(f"@{str(chat_username).lstrip('@')}")
+            if clean_link.startswith("@"):
+                join_targets.append(clean_link)
+            if resolved_target and not str(resolved_target).startswith("https://t.me/"):
+                join_targets.append(resolved_target)
+            if chat_info and getattr(chat_info, "id", None) is not None:
+                join_targets.append(int(chat_info.id))
+            join_targets.append(clean_link)
+
+        unique_targets = []
+        for target in join_targets:
+            if target not in unique_targets:
+                unique_targets.append(target)
+
+        last_error = None
+        for join_target in unique_targets:
+            try:
+                print(
+                    f"🔎 Acc {account_index + 1} trying join target "
+                    f"{join_target!r} for {clean_link}"
+                )
+                joined_chat = await user_app.join_chat(join_target)
                 joined = True
-                print(f"✅ Acc {account_index + 1} is already in {clean_link}")
-            else:
-                record_failure(account_index + 1, clean_link, error)
-                print(f"❌ Acc {account_index + 1} failed to join {clean_link}: {error}")
+                print(f"✅ Acc {account_index + 1} joined {clean_link}")
+                if getattr(joined_chat, "id", None) is not None:
+                    db.setdefault("group_chat_ids", {})[clean_link] = str(joined_chat.id)
+                break
+            except Exception as error:
+                last_error = error
+                error_text = str(error).upper()
+                if "ALREADY_PARTICIPANT" in error_text or "USER_ALREADY_PARTICIPANT" in error_text:
+                    joined = True
+                    print(f"✅ Acc {account_index + 1} is already in {clean_link}")
+                    break
+                print(
+                    f"⚠️ Acc {account_index + 1} target {join_target!r} failed: {error}"
+                )
+
+        if not joined and last_error is not None:
+            record_failure(account_index + 1, clean_link, last_error)
+            print(f"❌ Acc {account_index + 1} failed to join {clean_link}: {last_error}")
         if joined:
             account_joined_channels.setdefault(account_key, {})[clean_link] = True
         if clean_link not in db.get("group_chat_ids", {}):
