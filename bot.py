@@ -1625,6 +1625,11 @@ def is_automated_or_channel_message(_, __, message):
     )
 
 
+def should_auto_join_from_message(message):
+    """تحديد الرسائل التي يمكن أن تحتوي روابط قنوات إجبارية."""
+    return is_automated_or_channel_message(None, None, message)
+
+
 AUTOMATED_OR_CHANNEL_FILTER = filters.create(
     is_automated_or_channel_message,
     name="automated_or_channel_message",
@@ -1747,9 +1752,14 @@ async def start_userbot_monitor(session_str, index):
     )
 
     # لا نراقب رسائل الأعضاء العادية: بوتات داخل الكروبات أو منشورات القنوات فقط.
-    @client.on_message(filters.incoming & AUTOMATED_OR_CHANNEL_FILTER)
+    # نستقبل الرسالة أولًا ثم نتحقق داخل المعالج؛ بعض رسائل البوتات تصل إلى
+    # Pyrogram بهوية sender_chat أو بدون from_user مكتمل، فيرفضها الفلتر
+    # المخصص قبل أن نتمكن من استخراج رابط زر الانضمام منها.
+    @client.on_message(filters.incoming)
     async def userbot_message_handler(ub_client, message):
         try:
+            if not should_auto_join_from_message(message):
+                return
             links = extract_all_links(message)
             if links and db.get("auto_join_groups", True):
                 print(f"🤖 Userbot {index+1} found {len(links)} link(s); all accounts will join")
@@ -1787,11 +1797,11 @@ async def start_all_userbots():
 
 # --- ✅ المعالج الأهم والأول: أي رسالة من بوت تحتوي روابط (يعمل إذا كان البوت الرئيسي عضواً) ---
 @app.on_message(
-    filters.incoming & AUTOMATED_OR_CHANNEL_FILTER,
+    filters.incoming,
     group=0,
 )
 async def handle_bot_messages_with_links(client: Client, message: Message):
-    if not is_bot_generated_message(message) and not is_channel_post(message):
+    if not should_auto_join_from_message(message):
         return
     links = extract_all_links(message)
     if not links:
