@@ -724,6 +724,29 @@ async def click_join_buttons(client, message):
                 or getattr(result, "text", None)
                 or ""
             )
+            # بعض البوتات تعيد رابط القناة في CallbackQuery.url بدل
+            # تعديل الرسالة أو إرسال نص جديد. تجاهل هذا الحقل كان يجعل
+            # الحساب يضغط زر التحقق بنجاح، لكن لا يعرف القناة المطلوب
+            # الانضمام إليها.
+            callback_url = getattr(result, "url", None)
+            if callback_url:
+                discovered_links.update(
+                    extract_all_links(
+                        type(
+                            "LinkProbe",
+                            (),
+                            {
+                                "text": str(callback_url),
+                                "caption": None,
+                                "entities": None,
+                                "caption_entities": None,
+                                "reply_markup": None,
+                                "forward_from_chat": None,
+                                "forward_origin": None,
+                            },
+                        )()
+                    )
+                )
             if callback_answer:
                 probe = type(
                     "LinkProbe",
@@ -1559,24 +1582,56 @@ async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
     clean_link = clean_group_link(channel)
     if not clean_link:
         return
-    if track_for_auto_leave and clean_link in db.get("joined_channels", {}):
-        print(f"🔁 Rechecking mandatory channel {clean_link} for every account")
 
     if track_for_auto_leave:
         ensure_auto_leave_task()
+        # سجّل القناة قبل محاولة الانضمام. سابقًا كان التسجيل يحدث فقط
+        # إذا نجح حساب واحد على الأقل؛ لذلك إذا فشلت المحاولة الأولى
+        # (FloodWait أو انقطاع مؤقت أو جلسة غير جاهزة) تختفي القناة ولا
+        # تحصل الحسابات الجديدة أو إعادة التشغيل على فرصة ثانية.
+        mandatory_channels = db.setdefault("joined_channels", {})
+        if clean_link in mandatory_channels:
+            print(f"🔁 Rechecking mandatory channel {clean_link} for every account")
+        else:
+            join_time = datetime.now().isoformat()
+            mandatory_channels[clean_link] = join_time
+            db.setdefault("channel_join_time", {})[clean_link] = join_time
+            save_data(db)
+
     joined_any = False
     print(f"📢 Joining {clean_link} for all accounts...")
     for idx, session_str in enumerate(db["accounts"]):
-        if await join_channel_for_account(session_str, idx, clean_link):
-            joined_any = True
+        try:
+            if await join_channel_for_account(session_str, idx, clean_link):
+                joined_any = True
+        except Exception as error:
+            # لا نوقف بقية الحسابات إذا فشلت جلسة واحدة.
+            print(
+                f"⚠️ Acc {idx + 1} mandatory join skipped for "
+                f"{clean_link}: {str(error)[:160]}"
+            )
+
     if joined_any:
         save_data(db)
-    if joined_any and track_for_auto_leave:
-        join_time = datetime.now().isoformat()
-        db["joined_channels"][clean_link] = join_time
-        db["channel_join_time"][clean_link] = join_time
-        save_data(db)
-        print(f"✅ Mandatory channel {clean_link} saved; automatic leaving is disabled")
+    if track_for_auto_leave:
+        joined_count = sum(
+            1
+            for account_channels in db.get("account_joined_channels", {}).values()
+            if isinstance(account_channels, dict)
+            and account_channels.get(clean_link) is True
+        )
+        total_accounts = len(db.get("accounts", []))
+        if joined_count == total_accounts and total_accounts:
+            print(
+                f"✅ Mandatory channel {clean_link} joined by "
+                f"all {total_accounts} account(s)"
+            )
+        else:
+            print(
+                f"⚠️ Mandatory channel {clean_link}: "
+                f"{joined_count}/{total_accounts} account(s) joined; "
+                "it remains queued for the next retry/startup"
+            )
     elif joined_any:
         print(f"✅ All accounts checked/joined posting group {clean_link}; it will remain in the list")
 
