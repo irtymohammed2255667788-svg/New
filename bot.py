@@ -106,6 +106,7 @@ def default_profile_data():
         "joined_channels": {},
         "channel_join_time": {},
         "account_joined_channels": {},
+        "account_join_waits": {},
         "account_errors": {},
         "last_group_index": {},
         "last_sent_group_index": -1,
@@ -1140,6 +1141,7 @@ def failure_guidance(error_text):
     upper = text.upper()
     rules = [
         (("FLOODWAIT", "FLOOD_WAIT"), "Telegram طلب الانتظار بسبب كثرة الطلبات.", "انتظر المدة الظاهرة، وارفع قيمة المؤقت أو قلّل عدد الحسابات."),
+        (("USER_NOT_ACCEPTED", "INVITE_REQUEST_SENT"), "Telegram لم يقبل الحساب في هذه الدعوة أو أرسل طلب انضمام بانتظار الموافقة.", "لا تعاود المحاولة بسرعة؛ وافق مشرف القناة على الطلب أو استخدم رابط دعوة صالحًا."),
         (("USERBANNEDINCHANNEL", "USER_BANNED_IN_CHANNEL"), "الحساب ممنوع من المجموعة أو القناة.", "أزل الحظر من Telegram أو استخدم حسابًا آخر ثم أعد المحاولة."),
         (("PEER_ID_INVALID", "ID NOT FOUND", "PEER INVALID"), "معرّف المجموعة غير متاح داخل جلسة هذا الحساب.", "أعد إضافة المجموعة باستخدام @username أو رابط دعوة، وتأكد أن الحساب عضو فيها."),
         (("CHAT_WRITE_FORBIDDEN", "CHAT_ADMIN_REQUIRED"), "الحساب لا يملك صلاحية الكتابة في المجموعة.", "امنح الحساب صلاحية إرسال الرسائل أو اختر مجموعة تسمح بالكتابة."),
@@ -1459,8 +1461,32 @@ async def join_channel_for_account(session_str, account_index, channel):
     account_joined_channels = db.setdefault("account_joined_channels", {})
     already_confirmed = account_joined_channels.get(account_key, {}).get(clean_link) is True
     if already_confirmed:
-        # أعد التحقق داخل جلسة الحساب؛ الـ ID العام قديم أو يخص حسابًا آخر.
-        print(f"🔄 Acc {account_index + 1} rechecking membership in {clean_link}")
+        # لا تعاود JoinChannel في كل تشغيل؛ ذلك كان يعيد طلب الانضمام
+        # للقنوات التي انضم إليها الحساب فعلًا ويؤدي إلى FLOOD_WAIT.
+        print(f"✅ Acc {account_index + 1} already joined {clean_link}; skipping")
+        return True
+
+    join_waits = db.setdefault("account_join_waits", {})
+    wait_key = f"{account_key}:{clean_link}"
+    wait_until = float(join_waits.get(wait_key, 0) or 0)
+    now_ts = datetime.now().timestamp()
+    if wait_until > now_ts:
+        remaining = max(1, int(wait_until - now_ts))
+        print(
+            f"⏳ Acc {account_index + 1} skipping {clean_link}; "
+            f"Telegram join wait {remaining}s remains"
+        )
+        return False
+    join_waits.pop(wait_key, None)
+
+    def remember_join_flood_wait(error):
+        seconds = max(1, int(getattr(error, "x", 60) or 60))
+        join_waits[wait_key] = datetime.now().timestamp() + seconds
+        save_data(db)
+        print(
+            f"⏳ Acc {account_index + 1} must wait {seconds}s before "
+            f"retrying join for {clean_link}"
+        )
 
     user_app = None
     joined = False
@@ -1503,6 +1529,7 @@ async def join_channel_for_account(session_str, account_index, channel):
                 unique_targets.append(target)
 
         last_error = None
+        skip_followup_lookup = False
         for join_target in unique_targets:
             try:
                 print(
@@ -1518,9 +1545,35 @@ async def join_channel_for_account(session_str, account_index, channel):
             except Exception as error:
                 last_error = error
                 error_text = str(error).upper()
+                if isinstance(error, FloodWait):
+                    # FLOOD_WAIT يخص الحساب كله؛ تجربة targets أخرى هنا
+                    # تزيد مدة المنع، لذلك نحفظ وقت الانتظار ونخرج فورًا.
+                    remember_join_flood_wait(error)
+                    skip_followup_lookup = True
+                    print(
+                        f"⚠️ Acc {account_index + 1} join paused for "
+                        f"{getattr(error, 'x', 60)}s"
+                    )
+                    break
                 if "ALREADY_PARTICIPANT" in error_text or "USER_ALREADY_PARTICIPANT" in error_text:
                     joined = True
                     print(f"✅ Acc {account_index + 1} is already in {clean_link}")
+                    break
+                if any(
+                    marker in error_text
+                    for marker in (
+                        "USER_NOT_ACCEPTED",
+                        "INVITE_REQUEST_SENT",
+                        "INVITE_HASH_EXPIRED",
+                        "INVITE_HASH_INVALID",
+                    )
+                ):
+                    # لا توجد فائدة من تجربة ID/username/link آخر لنفس الدعوة.
+                    skip_followup_lookup = True
+                    print(
+                        f"⚠️ Acc {account_index + 1} cannot join {clean_link}; "
+                        "Telegram rejected the invite"
+                    )
                     break
                 print(
                     f"⚠️ Acc {account_index + 1} target {join_target!r} failed: {error}"
@@ -1531,6 +1584,8 @@ async def join_channel_for_account(session_str, account_index, channel):
             print(f"❌ Acc {account_index + 1} failed to join {clean_link}: {last_error}")
         if joined:
             account_joined_channels.setdefault(account_key, {})[clean_link] = True
+        if not joined and skip_followup_lookup:
+            return False
         if clean_link not in db.get("group_chat_ids", {}):
             try:
                 chat_info = await user_app.get_chat(resolved_target)
@@ -1538,6 +1593,13 @@ async def join_channel_for_account(session_str, account_index, channel):
                 chat_info = await get_chat_from_private_invite(user_app, clean_link)
             if chat_info and getattr(chat_info, "id", None) is not None:
                 db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
+    except FloodWait as error:
+        remember_join_flood_wait(error)
+        record_failure(account_index + 1, clean_link, error)
+        print(
+            f"⏳ Acc {account_index + 1} join paused for "
+            f"{getattr(error, 'x', 60)}s: {clean_link}"
+        )
     except Exception as error:
         record_failure(account_index + 1, clean_link, error)
         print(f"❌ Error opening acc {account_index + 1} for {clean_link}: {error}")
