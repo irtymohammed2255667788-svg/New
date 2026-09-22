@@ -47,8 +47,10 @@ ENABLE_USERBOT_MONITORING = (
 )
 
 try:
-    OWNER_ID = int(OWNER_ID_RAW)
-    API_ID = int(API_ID_RAW)
+    # استخدم 0 للقيم الفارغة حتى تظهر جميع المتغيرات الناقصة في رسالة واحدة
+    # بدل أن يتوقف البرنامج بخطأ تحويل غامض قبل فحص الإعدادات.
+    OWNER_ID = int(OWNER_ID_RAW or "0")
+    API_ID = int(API_ID_RAW or "0")
 except ValueError as exc:
     raise RuntimeError("OWNER_ID and API_ID must be numeric environment variables") from exc
 
@@ -65,7 +67,13 @@ if missing_settings:
     raise RuntimeError(f"Missing or invalid environment variables: {', '.join(missing_settings)}")
 
 # --- Data file ---
-DATA_FILE = "/app/data/bot_data.json"
+# لا تفترض أن /app قابل للكتابة؛ بعض المنصات تشغّل المشروع في مسار آخر
+# أو تمنع الكتابة في /app، وعندها يتوقف البوت قبل تسجيل أي معالج.
+# يمكن تحديد مسار دائم/مركّب عبر DATA_FILE، وإلا يُحفظ بجانب المشروع.
+DATA_FILE = os.path.abspath(
+    os.environ.get("DATA_FILE")
+    or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "bot_data.json")
+)
 login_sessions = {}
 profile_context = ContextVar("profile_context", default=None)
 profile_posting_tasks = {}
