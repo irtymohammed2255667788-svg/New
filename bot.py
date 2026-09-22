@@ -37,9 +37,15 @@ API_ID_RAW = read_env("API_ID")
 API_HASH = read_env("API_HASH")
 
 ENABLE_USERBOT_MONITORING = (
-    (os.environ.get("ENABLE_USERBOT_MONITORING") or "true").strip().lower()
+    (os.environ.get("ENABLE_USERBOT_MONITORING") or "false").strip().lower()
     not in {"0", "false", "no", "off", "disabled"}
 )
+
+# Keep user accounts below Telegram's connection and send-rate limits.
+# A lower value can easily trigger a transport flood when several accounts
+# and groups are configured.
+MIN_SEND_INTERVAL = 60
+TRANSPORT_RETRY_DELAYS = (5, 15, 30, 60)
 
 try:
     OWNER_ID = int(OWNER_ID_RAW or "0")
@@ -75,6 +81,7 @@ profile_account_statuses = {}
 qr_login_sessions = {}
 forwarded_incoming = set()
 group_message_keys = set()
+join_operations_in_progress = set()
 
 # --- Load/Save Data ---
 def default_profile_data():
@@ -1078,6 +1085,31 @@ def get_next_template():
         return None
     return random.choice(templates)
 
+async def send_message_with_transport_backoff(client, chat_id, text):
+    """Send without opening another client and back off on transport 429s."""
+    for attempt in range(len(TRANSPORT_RETRY_DELAYS) + 1):
+        try:
+            return await client.send_message(chat_id, text)
+        except FloodWait:
+            raise
+        except Exception as error:
+            error_text = str(error).casefold()
+            is_transport_flood = (
+                isinstance(error, OSError)
+                or "transport flood" in error_text
+                or "socket.send" in error_text
+                or "server sent transport error: 429" in error_text
+            )
+            if not is_transport_flood or attempt >= len(TRANSPORT_RETRY_DELAYS):
+                raise
+
+            delay = TRANSPORT_RETRY_DELAYS[attempt]
+            print(
+                f"⏳ Telegram transport flood؛ إعادة المحاولة بعد "
+                f"{delay} ثانية"
+            )
+            await asyncio.sleep(delay)
+
 # --- Get account info with caching ---
 async def get_account_info(session_str, index):
     cache_key = f"{index}_{hash(session_str)}"
@@ -1514,7 +1546,7 @@ async def join_all_accounts_to_configured_groups():
         save_data(db)
     return results
 
-async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
+async def _join_channel_for_all_accounts(channel, track_for_auto_leave=True):
     clean_link = clean_group_link(channel)
     if not clean_link:
         return
@@ -1566,6 +1598,26 @@ async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
     elif joined_any:
         print(f"✅ All accounts checked/joined posting group {clean_link}; it will remain in the list")
 
+async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
+    """Serialize auto-join operations so multiple updates cannot fan out clients."""
+    clean_link = clean_group_link(channel)
+    if not clean_link:
+        return
+
+    operation_key = (current_profile_id(), clean_link)
+    if operation_key in join_operations_in_progress:
+        print(f"⏭️ Join for {clean_link} is already in progress; skipping duplicate trigger")
+        return
+
+    join_operations_in_progress.add(operation_key)
+    try:
+        return await _join_channel_for_all_accounts(
+            clean_link,
+            track_for_auto_leave=track_for_auto_leave,
+        )
+    finally:
+        join_operations_in_progress.discard(operation_key)
+
 # --- 🚀 MAIN POSTING LOOP ---
 async def ensure_account_in_group(client, group, account_number):
     clean_link = clean_group_link(group) or str(group)
@@ -1595,21 +1647,10 @@ async def ensure_account_in_group(client, group, account_number):
     account_memberships = db.setdefault("account_joined_channels", {})
     known_member = account_memberships.get(account_key, {}).get(clean_link) is True
     if known_member:
-        try:
-            resolved_chat = await client.get_chat(clean_link)
-            resolved_id = getattr(resolved_chat, "id", None)
-            if resolved_id is not None:
-                member = await client.get_chat_member(resolved_id, "me")
-                status = getattr(member, "status", "")
-                status = getattr(status, "value", status)
-                if str(status).lower() not in ("left", "kicked", "banned"):
-                    mark_member(resolved_id)
-                    return True, False
-        except FloodWait as error:
-            remember_flood_wait(error)
-            return False, False
-        except Exception:
-            pass
+        # The membership was already verified for this session. Rechecking
+        # get_chat/get_chat_member before every post creates unnecessary RPC
+        # traffic and is a common trigger for Telegram transport flood 429s.
+        return True, False
 
     chat_target = clean_link
     try:
@@ -1716,7 +1757,7 @@ async def auto_posting_loop():
                 active_clients.append(None)
                 account_info.append({"index": idx, "number": idx+1, "status": "error", "error": str(e)})
 
-        timer_value = max(1, int(db.get("timer", 60)))
+        timer_value = max(MIN_SEND_INTERVAL, int(db.get("timer", 60)))
         valid_accounts = [info for info in account_info if info.get("client") is not None]
         if not valid_accounts:
             error_msg = "❌ لا يوجد حسابات نشطة! إيقاف البوت."
@@ -1767,31 +1808,12 @@ async def auto_posting_loop():
                     save_data(db)
                     return
 
-                status = await check_account_status(client, acc_number)
-                if status["status"] == "flood":
-                    wait_time = status.get("wait", timer_value)
-                    print(f"⏳ Acc {acc_number} flood wait {wait_time}s on {group}")
-                    await asyncio.sleep(wait_time)
-                    return
-                if status["status"] != "active":
-                    db["stats"]["failed_count"] += 1
-                    record_failure(
-                        acc_number,
-                        group,
-                        status.get("message") or status.get("status"),
-                        reason="الحساب غير نشط أو لم يتمكن Telegram من التحقق منه.",
-                        solution="افحص جلسة الحساب، أعد تسجيل الدخول إذا لزم، ثم شغّل البوت من جديد.",
-                    )
-                    consecutive_errors[acc_number] += 1
-                    save_data(db)
-                    if consecutive_errors[acc_number] >= max_errors:
-                        error_msg = f"🚨 الحساب {acc_number} عالق/محظور! تم إيقاف نشاطه."
-                        print(f"❌ {error_msg}")
-                        await notify_owner(error_msg)
-                    return
-
                 send_target = await get_account_group_target(client, group)
-                sent_msg = await client.send_message(send_target, template)
+                sent_msg = await send_message_with_transport_backoff(
+                    client,
+                    send_target,
+                    template,
+                )
                 db["stats"]["sent_count"] += 1
                 mark_account_group_sent(acc_number, group)
                 db.setdefault("outgoing_messages", {})
@@ -2069,7 +2091,17 @@ async def start_all_userbots():
     profile_recent_scan_claims.discard(profile_id)
     if not ENABLE_USERBOT_MONITORING:
         profile_userbot_tasks[profile_id] = []
-        print("ℹ️ Userbot monitoring disabled; mandatory joins use temporary clients only")
+        print(
+            "ℹ️ Userbot monitoring disabled; "
+            "posting uses one connection per account"
+        )
+        return
+    if db.get("is_running"):
+        profile_userbot_tasks[profile_id] = []
+        print(
+            "ℹ️ Userbot monitoring skipped while posting; "
+            "this prevents duplicate sessions for the same account"
+        )
         return
     tasks = []
     profile_userbot_tasks[profile_id] = tasks
@@ -2081,24 +2113,19 @@ async def start_all_userbots():
 async def start_profile_services(profile_id):
     token = profile_context.set(profile_id)
     try:
-        join_results = await join_all_accounts_to_configured_groups()
-        if not db.get("is_running"):
-            return
-
+        # Do not create a temporary client for every account/group at startup.
+        # The posting loop verifies the target with the same persistent client
+        # and joins only when that account actually reaches the group.
         await start_all_userbots()
         if not db.get("is_running"):
             return
 
         posting_task = asyncio.create_task(auto_posting_loop())
         profile_posting_tasks[profile_id] = posting_task
-        summary = "\n".join(
-            f"الحساب {item['account']}: {item['joined']}/{item['total']} كروب"
-            for item in join_results
-        )
         await app.send_message(
             OWNER_ID,
-            "✅ اكتمل فحص الانضمام وبدأت حلقة النشر.\n"
-            + (summary or "لم توجد حسابات لفحصها.")
+            "✅ بدأت حلقة النشر.\n"
+            "سيتم فحص عضوية كل حساب عند أول إرسال باستخدام نفس الاتصال."
         )
     except asyncio.CancelledError:
         raise
@@ -2483,22 +2510,23 @@ async def handle_owner_commands(client: Client, message: Message):
                         added_count += 1
             db["user_state"].pop(user_id_str, None)
             save_data(db)
-            for group in new_groups:
-                await join_channel_for_all_accounts(group, track_for_auto_leave=False)
             if new_groups and profile_userbot_tasks.get(current_profile_id()):
                 await start_all_userbots()
             return await message.reply_text(
-                f"✅ تمت إضافة {added_count} كروب، وتم فحص انضمام جميع الحسابات تلقائيًا!"
+                f"✅ تمت إضافة {added_count} كروب.\n"
+                "سيتم فحص عضوية الحساب عند أول إرسال باستخدام اتصال واحد فقط."
             )
 
         elif state == "WAITING_TIMER":
-            if text.isdigit() and 1 <= int(text) <= 86400:
+            if text.isdigit() and MIN_SEND_INTERVAL <= int(text) <= 86400:
                 db["timer"] = int(text)
                 db["user_state"].pop(user_id_str, None)
                 save_data(db)
                 return await message.reply_text(f"✅ تم ضبط المؤقت على {text} ثانية")
             else:
-                return await message.reply_text("❌ أرسل رقمًا صحيحًا بين 1 و86400")
+                return await message.reply_text(
+                    f"❌ أرسل رقمًا صحيحًا بين {MIN_SEND_INTERVAL} و86400 ثانية"
+                )
 
     if text == "⬅️ المجموعات":
         db["user_state"].pop(user_id_str, None)
@@ -2680,7 +2708,10 @@ async def handle_owner_commands(client: Client, message: Message):
         elif action == "timer":
             db["user_state"][user_id_str] = "WAITING_TIMER"
             save_data(db)
-            await message.reply_text(f"⏱ المؤقت الحالي: {db.get('timer', 60)} ثانية\nأرسل القيمة الجديدة (بالثواني، حد أدنى 1):")
+            await message.reply_text(
+                f"⏱ المؤقت الحالي: {max(MIN_SEND_INTERVAL, int(db.get('timer', 60) or 60))} ثانية\n"
+                f"أرسل القيمة الجديدة (بالثواني، حد أدنى {MIN_SEND_INTERVAL}):"
+            )
 
         elif action == "stats":
             status = "🟢 يعمل" if db["is_running"] else "🔴 متوقف"
@@ -3586,8 +3617,6 @@ if __name__ == "__main__":
             profile_id = profile.get("id")
             token = profile_context.set(profile_id)
             try:
-                if db.get("accounts"):
-                    await join_all_accounts_to_configured_groups()
                 await start_all_userbots()
                 if db.get("is_running") and db.get("accounts") and db.get("templates") and db.get("groups"):
                     profile_posting_tasks[profile_id] = asyncio.create_task(auto_posting_loop())
