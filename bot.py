@@ -1205,6 +1205,7 @@ async def get_account_info(session_str, index):
             api_id=API_ID,
             api_hash=API_HASH,
             session_string=_normalize_session_string(session_str),
+            in_memory=True,
         )
         await temp_client.connect()
         me = await temp_client.get_me()
@@ -1330,8 +1331,12 @@ async def auto_leave_channels():
                             api_id=API_ID,
                             api_hash=API_HASH,
                             session_string=_normalize_session_string(session_str),
+                            in_memory=True,
                         )
-                        await _start_user_client(user_app)
+                        # هذا العميل مؤقت لتنفيذ المغادرة فقط؛ لا تشغّل
+                        # حلقة استقبال التحديثات حتى لا تبقى مهمة تعمل بعد
+                        # إغلاق قاعدة جلسة SQLite.
+                        await _start_user_client(user_app, start_updates=False)
                         await user_app.leave_chat(get_group_chat_target(channel))
                         print(f"🚪 Acc {idx+1} left {channel}")
                     except Exception as e:
@@ -1465,8 +1470,10 @@ async def join_channel_for_account(session_str, account_index, channel):
             api_id=API_ID,
             api_hash=API_HASH,
             session_string=_normalize_session_string(session_str),
+            in_memory=True,
         )
-        await _start_user_client(user_app)
+        # عميل الانضمام قصير العمر ولا يحتاج إلى استقبال التحديثات.
+        await _start_user_client(user_app, start_updates=False)
         chat_info, resolved_target = await resolve_chat_for_join(user_app, channel)
         if chat_info is None and is_private_invite_link(clean_link):
             chat_info = await get_chat_from_private_invite(user_app, clean_link)
@@ -1777,6 +1784,7 @@ async def auto_posting_loop():
                     api_id=API_ID,
                     api_hash=API_HASH,
                     session_string=_normalize_session_string(session_str),
+                    in_memory=True,
                 )
                 me = await _start_user_client(client)
                 active_clients.append(client)
@@ -2110,6 +2118,7 @@ async def start_userbot_monitor(session_str, index):
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=_normalize_session_string(session_str),
+        in_memory=True,
     )
 
     # لا نراقب رسائل الأعضاء العادية: بوتات داخل الكروبات أو منشورات القنوات فقط.
@@ -2308,8 +2317,11 @@ async def handle_owner_commands(client: Client, message: Message):
                             api_id=API_ID,
                             api_hash=API_HASH,
                             session_string=_normalize_session_string(session_str),
+                            in_memory=True,
                         )
-                        await _start_user_client(user_client)
+                        # عميل الرد قصير العمر؛ تشغيل update loop هنا يسبب
+                        # مهمة خلفية تحاول استخدام SQLite بعد إغلاقها.
+                        await _start_user_client(user_client, start_updates=False)
                         await user_client.send_message(chat_id, reply_text, reply_to_message_id=message_id)
                         await user_client.stop()
                         await message.reply_text(f"✅ تم إرسال الرد من الحساب {account_number}")
@@ -3195,8 +3207,8 @@ def _normalize_session_string(session_str):
         return raw
 
 
-async def _start_user_client(client):
-    """تشغيل جلسة مستخدم دون السماح لـ Pyrogram بفتح إدخال تفاعلي."""
+async def _start_user_client(client, *, start_updates=True):
+    """تشغيل جلسة مستخدم دون إدخال تفاعلي أو update loop غير ضروري."""
     try:
         is_authorized = await client.connect()
         if not is_authorized:
@@ -3214,7 +3226,11 @@ async def _start_user_client(client):
 
         await client.invoke(raw.functions.updates.GetState())
         client.me = await client.get_me()
-        await client.initialize()
+        # initialize() يشغّل Client.handle_updates() في الخلفية. العملاء
+        # المؤقتون (الانضمام/المغادرة/الرد) لا يحتاجونه، وتشغيله ثم إغلاق
+        # SQLite سريعًا يسبب: Cannot operate on a closed database.
+        if start_updates:
+            await client.initialize()
         return client.me
     except Exception:
         if client.is_connected:
@@ -3238,6 +3254,7 @@ async def _recover_session_string(session_str, db, user_id_str):
             api_id=API_ID,
             api_hash=API_HASH,
             session_string=_normalize_session_string(session_str),
+            in_memory=True,
         )
         await temp_client.connect()
         me = await temp_client.get_me()
@@ -3642,8 +3659,9 @@ async def handle_callback(client: Client, callback_query):
                     api_id=API_ID,
                     api_hash=API_HASH,
                     session_string=_normalize_session_string(session_str),
+                    in_memory=True,
                 )
-                await _start_user_client(temp_client)
+                await _start_user_client(temp_client, start_updates=False)
                 await temp_client.log_out()
             except Exception as error:
                 logout_error = error
