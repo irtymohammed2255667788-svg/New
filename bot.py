@@ -16,6 +16,8 @@ from pyrogram.errors import (
     SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, 
     FloodWait, AuthKeyUnregistered, PeerIdInvalid, UserBannedInChannel
 )
+from pyrogram.session import Session
+from pyrogram.session.auth import Auth
 try:
     from pyrogram.raw.functions.messages import CheckChatInvite
 except ImportError:
@@ -2925,22 +2927,22 @@ async def _export_qr_login_token(client):
     )
 
 async def _import_migrated_qr_token(client, token_result):
-    dc_option = await client.get_dc_option(
-        token_result.dc_id,
-        ipv6=client.ipv6,
-    )
-    await client.session.stop()
-    client.session = await client.get_session(
-        dc_id=token_result.dc_id,
-        server_address=dc_option.ip_address,
-        port=dc_option.port,
-        export_authorization=False,
-        temporary=True,
-    )
-    await client.storage.dc_id(token_result.dc_id)
-    await client.storage.server_address(dc_option.ip_address)
-    await client.storage.port(dc_option.port)
-    await client.storage.auth_key(client.session.auth_key)
+    # auth.exportLoginToken may ask us to continue on another DC.  The
+    # previous implementation used get_dc_option/get_session, which are not
+    # Pyrogram Client APIs and left the replacement session unstarted.  Build
+    # and start a real Pyrogram Session instead, then persist its DC/auth key
+    # so the exported session string belongs to the migrated session.
+    dc_id = token_result.dc_id
+    test_mode = await client.storage.test_mode()
+    auth_key = await Auth(client, dc_id, test_mode).create()
+
+    if client.session is not None:
+        await client.session.stop()
+
+    client.session = Session(client, dc_id, auth_key, test_mode)
+    await client.session.start()
+    await client.storage.dc_id(dc_id)
+    await client.storage.auth_key(auth_key)
     return await client.invoke(
         raw.functions.auth.ImportLoginToken(token=token_result.token)
     )
