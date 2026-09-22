@@ -2522,6 +2522,23 @@ async def handle_owner_commands(client: Client, message: Message):
                 "امسح الرمز المرسل لك، أو اضغط «إلغاء» لإيقاف العملية."
             )
 
+        elif state == "WAITING_QR_PASSWORD":
+            qr_session = qr_login_sessions.get(OWNER_ID)
+            password_future = (qr_session or {}).get("password_future")
+            if not password_future or password_future.done():
+                return await message.reply_text(
+                    "❌ انتهت جلسة طلب كلمة المرور. أعد إصدار رمز QR جديدًا."
+                )
+            password = text.strip()
+            if not password:
+                return await message.reply_text("❌ أرسل كلمة المرور كما هي.")
+            password_future.set_result(password)
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            return await app.send_message(OWNER_ID, "⏳ جارٍ التحقق من كلمة المرور...")
+
         elif state == "WAITING_TEMPLATE":
             lines = text.strip().split('\n')
             added_count = 0
@@ -2947,6 +2964,46 @@ async def _import_migrated_qr_token(client, token_result):
         raw.functions.auth.ImportLoginToken(token=token_result.token)
     )
 
+async def _request_qr_password(session_info, cancel_event):
+    """انتظار كلمة مرور 2FA دون حفظها في ملف البيانات."""
+    password_future = asyncio.get_running_loop().create_future()
+    session_info["password_future"] = password_future
+    db["user_state"][str(OWNER_ID)] = "WAITING_QR_PASSWORD"
+    save_data(db)
+
+    try:
+        try:
+            hint = await session_info["client"].get_password_hint()
+        except Exception:
+            hint = ""
+
+        hint_text = f"\n💡 التلميح: {hint}" if hint else ""
+        await app.send_message(
+            OWNER_ID,
+            "🔐 الحساب محمي بالتحقق بخطوتين.\n"
+            f"أرسل كلمة مرور Telegram لإكمال تسجيل الدخول عبر QR.{hint_text}\n"
+            "⚠️ لا يتم حفظ كلمة المرور في البيانات.",
+        )
+
+        cancel_task = asyncio.create_task(cancel_event.wait())
+        done, pending = await asyncio.wait(
+            {password_future, cancel_task},
+            timeout=180,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+        if cancel_task in done:
+            raise asyncio.CancelledError
+        if password_future not in done:
+            raise TimeoutError("انتهت مهلة انتظار كلمة مرور التحقق بخطوتين.")
+        return str(password_future.result() or "").strip()
+    finally:
+        if session_info.get("password_future") is password_future:
+            session_info.pop("password_future", None)
+
 async def _qr_login_worker():
     client = None
     handler_ref = None
@@ -3039,13 +3096,32 @@ async def _qr_login_worker():
             if scan_wait not in done:
                 continue
 
-            result = await _export_qr_login_token(client)
-            if isinstance(result, raw.types.auth.LoginTokenMigrateTo):
-                result = await _import_migrated_qr_token(client, result)
-            if not isinstance(result, raw.types.auth.LoginTokenSuccess):
-                continue
+            raw_user = None
+            try:
+                result = await _export_qr_login_token(client)
+                if isinstance(result, raw.types.auth.LoginTokenMigrateTo):
+                    result = await _import_migrated_qr_token(client, result)
+                if isinstance(result, raw.types.auth.LoginTokenSuccess):
+                    raw_user = getattr(result.authorization, "user", None)
+            except SessionPasswordNeeded:
+                for attempt in range(3):
+                    password = await _request_qr_password(
+                        session_info,
+                        cancel_event,
+                    )
+                    try:
+                        raw_user = await client.check_password(password)
+                        break
+                    except Exception as password_error:
+                        if attempt == 2:
+                            raise RuntimeError(
+                                "كلمة مرور التحقق بخطوتين غير صحيحة بعد 3 محاولات."
+                            ) from password_error
+                        await app.send_message(
+                            OWNER_ID,
+                            "❌ كلمة المرور غير صحيحة. أرسلها مرة أخرى:",
+                        )
 
-            raw_user = getattr(result.authorization, "user", None)
             if raw_user is None or not getattr(raw_user, "id", None):
                 raise RuntimeError("تم مسح الرمز لكن Telegram لم يعِد بيانات الحساب.")
 
