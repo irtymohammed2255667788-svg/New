@@ -1295,9 +1295,6 @@ async def resolve_chat_for_join(client, channel):
     return None, clean_link
 
 async def scan_recent_group_messages_for_mandatory_channels(client, account_index):
-    if not db.get("auto_join_groups", True):
-        return
-
     profile_id = current_profile_id()
     if profile_id in profile_recent_scan_claims:
         return
@@ -1315,6 +1312,12 @@ async def scan_recent_group_messages_for_mandatory_channels(client, account_inde
             )
             if history_target is None:
                 continue
+
+            resolved_chat_id = getattr(chat_info, "id", None)
+            if resolved_chat_id is not None:
+                db.setdefault("group_chat_ids", {})[
+                    clean_group_link(group)
+                ] = str(resolved_chat_id)
 
             async for message in client.get_chat_history(
                 history_target,
@@ -1969,9 +1972,13 @@ def is_automated_or_channel_message(_, __, message):
     )
 
 def should_auto_join_from_message(message):
-    # Joining is intentionally stricter than reply forwarding: only a real
-    # Telegram bot may publish a join instruction, and only inside groups.
-    return is_group_message(message) and is_bot_generated_message(message)
+    # These are the only message-level gates for automatic joining:
+    # the sender must be a real Telegram bot and the chat must be one of the
+    # groups configured by the owner. Link parsing is handled separately.
+    return bool(
+        is_bot_generated_message(message)
+        and get_configured_group_for_chat(getattr(message, "chat", None))
+    )
 
 AUTOMATED_OR_CHANNEL_FILTER = filters.create(
     is_automated_or_channel_message,
@@ -2080,12 +2087,9 @@ async def start_userbot_monitor(client, index):
 
     async def userbot_message_handler(ub_client, message):
         try:
-            # Ignore every human, forwarded, and channel-authored message.
+            # Only the two gates in should_auto_join_from_message matter here:
+            # configured chat and bot sender. Link parsing happens afterward.
             if not should_auto_join_from_message(message):
-                return
-            if not get_configured_group_for_chat(message.chat):
-                return
-            if not db.get("auto_join_groups", True):
                 return
             links = set(extract_all_links(message))
             clicked_links = await click_join_buttons(ub_client, message)
