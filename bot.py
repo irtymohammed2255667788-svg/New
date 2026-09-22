@@ -37,7 +37,7 @@ API_ID_RAW = read_env("API_ID")
 API_HASH = read_env("API_HASH")
 
 ENABLE_USERBOT_MONITORING = (
-    (os.environ.get("ENABLE_USERBOT_MONITORING") or "false").strip().lower()
+    (os.environ.get("ENABLE_USERBOT_MONITORING") or "true").strip().lower()
     not in {"0", "false", "no", "off", "disabled"}
 )
 
@@ -78,6 +78,7 @@ profile_recent_scan_claims = set()
 profile_auto_leave_tasks = {}
 profile_account_caches = {}
 profile_account_statuses = {}
+profile_active_clients = {}
 qr_login_sessions = {}
 forwarded_incoming = set()
 group_message_keys = set()
@@ -1319,10 +1320,10 @@ async def scan_recent_group_messages_for_mandatory_channels(client, account_inde
                 history_target,
                 limit=history_limit,
             ):
-                if (
-                    should_auto_join_from_message(message)
-                    or get_join_button_positions(message)
-                ):
+                # Only bot-authored messages are allowed to trigger joins.
+                # A normal user's link, forwarded post, or channel post must
+                # never be treated as a mandatory-subscription instruction.
+                if should_auto_join_from_message(message):
                     discovered_links.update(extract_all_links(message))
                     discovered_links.update(
                         await click_join_buttons(client, message)
@@ -1350,7 +1351,7 @@ async def scan_recent_group_messages_for_mandatory_channels(client, account_inde
             )
 
 # --- Join channel for all accounts ---
-async def join_channel_for_account(session_str, account_index, channel):
+async def join_channel_for_account(session_str, account_index, channel, client=None):
     clean_link = clean_group_link(channel)
     if not clean_link:
         return False
@@ -1384,17 +1385,19 @@ async def join_channel_for_account(session_str, account_index, channel):
             f"retrying join for {clean_link}"
         )
 
-    user_app = None
+    user_app = client
+    owns_client = user_app is None
     joined = False
     try:
-        user_app = Client(
-            f"join_session_{current_profile_id()}_{account_index}",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            session_string=_normalize_session_string(session_str),
-            in_memory=True,
-        )
-        await _start_user_client(user_app, start_updates=False)
+        if owns_client:
+            user_app = Client(
+                f"join_session_{current_profile_id()}_{account_index}",
+                api_id=API_ID,
+                api_hash=API_HASH,
+                session_string=_normalize_session_string(session_str),
+                in_memory=True,
+            )
+            await _start_user_client(user_app, start_updates=False)
         chat_info, resolved_target = await resolve_chat_for_join(user_app, channel)
         if chat_info is None and is_private_invite_link(clean_link):
             chat_info = await get_chat_from_private_invite(user_app, clean_link)
@@ -1494,7 +1497,7 @@ async def join_channel_for_account(session_str, account_index, channel):
         record_failure(account_index + 1, clean_link, error)
         print(f"❌ Error opening acc {account_index + 1} for {clean_link}: {error}")
     finally:
-        if user_app:
+        if user_app and owns_client:
             try:
                 await user_app.stop()
             except Exception:
@@ -1507,10 +1510,20 @@ async def join_account_to_configured_groups(session_str, account_index):
     joined_count = 0
 
     for channel in mandatory_channels:
-        await join_channel_for_account(session_str, account_index, channel)
+        await join_channel_for_account(
+            session_str,
+            account_index,
+            channel,
+            client=profile_active_clients.get(current_profile_id(), {}).get(account_index),
+        )
 
     for group in groups:
-        if await join_channel_for_account(session_str, account_index, group):
+        if await join_channel_for_account(
+            session_str,
+            account_index,
+            group,
+            client=profile_active_clients.get(current_profile_id(), {}).get(account_index),
+        ):
             joined_count += 1
 
     if groups or mandatory_channels:
@@ -1564,9 +1577,15 @@ async def _join_channel_for_all_accounts(channel, track_for_auto_leave=True):
 
     joined_any = False
     print(f"📢 Joining {clean_link} for all accounts...")
+    active_clients = profile_active_clients.get(current_profile_id(), {})
     for idx, session_str in enumerate(db["accounts"]):
         try:
-            if await join_channel_for_account(session_str, idx, clean_link):
+            if await join_channel_for_account(
+                session_str,
+                idx,
+                clean_link,
+                client=active_clients.get(idx),
+            ):
                 joined_any = True
         except Exception as error:
             print(
@@ -1767,6 +1786,14 @@ async def auto_posting_loop():
             save_data(db)
             return
 
+        profile_active_clients[current_profile_id()] = {
+            info["index"]: info["client"] for info in valid_accounts
+        }
+
+        # Attach bot-message monitoring to these same live clients. This
+        # preserves the feature without opening a duplicate session per user.
+        await start_all_userbots(valid_accounts)
+
         print(f"🚀 Starting with {len(valid_accounts)} active accounts, interval: {timer_value}s")
         await notify_owner(f"🚀 بدء تشغيل البوت\n📊 {len(valid_accounts)} حساب نشط\n⏱ الفاصل بين كل إرسال: {timer_value} ثانية")
 
@@ -1899,6 +1926,8 @@ async def auto_posting_loop():
         print(f"❌ {error_msg}")
         await notify_owner(error_msg)
     finally:
+        await stop_all_userbots(current_profile_id())
+        profile_active_clients.pop(current_profile_id(), None)
         for client in active_clients:
             if client:
                 try:
@@ -1913,11 +1942,12 @@ async def auto_posting_loop():
 # ===== ⭐ جديد: مراقبة الحسابات (Userbots) لاستقبال رسائل البوتات في الكروبات =====
 def is_bot_generated_message(message):
     sender = getattr(message, "from_user", None)
-    via_bot = getattr(message, "via_bot", None)
-    return bool(
-        (sender and getattr(sender, "is_bot", False))
-        or (via_bot and getattr(via_bot, "is_bot", False))
-    )
+    return bool(sender and getattr(sender, "is_bot", False))
+
+def is_group_message(message):
+    chat = getattr(message, "chat", None)
+    chat_type = str(getattr(chat, "type", "") or "").casefold()
+    return chat_type.rsplit(".", 1)[-1] in {"group", "supergroup"}
 
 def is_channel_post(message):
     chat = getattr(message, "chat", None)
@@ -1939,7 +1969,9 @@ def is_automated_or_channel_message(_, __, message):
     )
 
 def should_auto_join_from_message(message):
-    return is_automated_or_channel_message(None, None, message)
+    # Joining is intentionally stricter than reply forwarding: only a real
+    # Telegram bot may publish a join instruction, and only inside groups.
+    return is_group_message(message) and is_bot_generated_message(message)
 
 AUTOMATED_OR_CHANNEL_FILTER = filters.create(
     is_automated_or_channel_message,
@@ -2042,22 +2074,16 @@ async def forward_group_message_to_owner(message, source_account=None):
     save_data(db)
     print(f"📩 Saved reply from {message.from_user.id} in {chat_id} for account {account_number}")
 
-async def start_userbot_monitor(session_str, index):
-    client = Client(
-        f"userbot_{current_profile_id()}_{index}",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        session_string=_normalize_session_string(session_str),
-        in_memory=True,
-    )
+async def start_userbot_monitor(client, index):
+    """Monitor an already-connected posting client for bot join instructions."""
+    handler_ref = None
 
-    @client.on_message(filters.incoming)
     async def userbot_message_handler(ub_client, message):
         try:
-            if (
-                not should_auto_join_from_message(message)
-                and not get_join_button_positions(message)
-            ):
+            # Ignore every human, forwarded, and channel-authored message.
+            if not should_auto_join_from_message(message):
+                return
+            if not get_configured_group_for_chat(message.chat):
                 return
             if not db.get("auto_join_groups", True):
                 return
@@ -2075,7 +2101,9 @@ async def start_userbot_monitor(session_str, index):
             print(f"⚠️ Userbot {index+1} skipped an update: {error}")
 
     try:
-        await _start_user_client(client)
+        handler_ref = client.add_handler(
+            handlers.MessageHandler(userbot_message_handler, filters.incoming)
+        )
         await scan_recent_group_messages_for_mandatory_channels(client, index)
         print(f"✅ Userbot {index+1} started monitoring groups")
         while True:
@@ -2083,30 +2111,37 @@ async def start_userbot_monitor(session_str, index):
     except Exception as e:
         print(f"❌ Userbot {index+1} failed: {str(e)[:80]}")
     finally:
-        await client.stop()
+        if handler_ref:
+            try:
+                client.remove_handler(*handler_ref)
+            except Exception:
+                pass
 
-async def start_all_userbots():
+async def start_all_userbots(account_info=None):
     profile_id = current_profile_id()
-    await stop_all_userbots(profile_id)
-    profile_recent_scan_claims.discard(profile_id)
+    # Calls from menu actions do not carry the live clients and must not
+    # disturb the monitors already attached to the posting loop.
+    if not account_info:
+        print("ℹ️ Userbot monitoring is waiting for the posting clients")
+        return
+
     if not ENABLE_USERBOT_MONITORING:
+        await stop_all_userbots(profile_id)
         profile_userbot_tasks[profile_id] = []
         print(
             "ℹ️ Userbot monitoring disabled; "
             "posting uses one connection per account"
         )
         return
-    if db.get("is_running"):
-        profile_userbot_tasks[profile_id] = []
-        print(
-            "ℹ️ Userbot monitoring skipped while posting; "
-            "this prevents duplicate sessions for the same account"
-        )
-        return
+
+    await stop_all_userbots(profile_id)
+    profile_recent_scan_claims.discard(profile_id)
     tasks = []
     profile_userbot_tasks[profile_id] = tasks
-    for idx, session_str in enumerate(db["accounts"]):
-        task = asyncio.create_task(start_userbot_monitor(session_str, idx))
+    for account in account_info:
+        task = asyncio.create_task(
+            start_userbot_monitor(account["client"], account["index"])
+        )
         tasks.append(task)
     print(f"🚀 Started monitoring {len(tasks)} accounts for {profile_id}")
 
@@ -2116,7 +2151,6 @@ async def start_profile_services(profile_id):
         # Do not create a temporary client for every account/group at startup.
         # The posting loop verifies the target with the same persistent client
         # and joins only when that account actually reaches the group.
-        await start_all_userbots()
         if not db.get("is_running"):
             return
 
@@ -2150,6 +2184,8 @@ async def start_profile_services(profile_id):
 )
 async def handle_bot_messages_with_links(client: Client, message: Message):
     if not should_auto_join_from_message(message):
+        return
+    if not get_configured_group_for_chat(message.chat):
         return
     links = extract_all_links(message)
     if not links:
@@ -3605,7 +3641,7 @@ if __name__ == "__main__":
     print("  🔄 Sequential posting system")
     print("  🎯 Template rotation (1, 2, 3...)")
     print("  🔄 Group rotation for each account")
-    print("  📡 Auto-join channels from ANY bot message (Userbots)")
+    print("  📡 Auto-join links from bot messages in groups only")
     print("  ⏰ Auto-leave after 24 hours")
     print("  👥 Reply forwarding to owner")
     print("  💬 Owner reply system")
