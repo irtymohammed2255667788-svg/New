@@ -5,12 +5,13 @@ import base64
 import struct
 import copy
 import json
+import io
 import random
 import re
 import tempfile
 from contextvars import ContextVar
 from datetime import datetime, timedelta
-from pyrogram import Client, filters, idle, raw, utils as pyrogram_utils
+from pyrogram import Client, filters, idle, raw, handlers, utils as pyrogram_utils
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import (
     SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, 
@@ -73,6 +74,7 @@ profile_recent_scan_claims = set()
 profile_auto_leave_tasks = {}
 profile_account_caches = {}
 profile_account_statuses = {}
+qr_login_sessions = {}
 forwarded_incoming = set()  # منع تكرار تحويل نفس الرسالة للمالك
 group_message_keys = set()  # منع عدّ نفس الرسالة مرتين عند تعدد الحسابات
 
@@ -504,7 +506,11 @@ app = Client(
 # --- Bot settings keyboard ---
 BOT_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("➕ إضافة حساب"), KeyboardButton("🔄 استرداد حساب")],
+        [
+            KeyboardButton("➕ إضافة حساب"),
+            KeyboardButton("📷 إضافة حساب QR"),
+        ],
+        [KeyboardButton("🔄 استرداد حساب")],
         [KeyboardButton("🗑 حذف حساب"), KeyboardButton("📋 قائمة الحسابات")],
         [KeyboardButton("📋 قائمة الكروبات")],
         [KeyboardButton("📝 إضافة كليشة"), KeyboardButton("🗑 حذف كليشة")],
@@ -524,6 +530,7 @@ MENU_ACTIONS = {
     "accounts": {"📋 قائمة الحسابات", "قائمة الحسابات", "📋 Accounts"},
     "groups": {"📋 قائمة الكروبات", "قائمة الكروبات", "📋 Groups"},
     "add_account": {"➕ إضافة حساب", "إضافة حساب", "➕ Add Acc"},
+    "add_account_qr": {"📷 إضافة حساب QR", "إضافة حساب QR", "📷 QR Login"},
     "recover_account": {"🔄 استرداد حساب", "استرداد حساب", "🔄 Recover"},
     "delete_account": {"🗑 حذف حساب", "حذف حساب", "🗑 Delete Acc"},
     "add_text": {"📝 إضافة كليشة", "إضافة كليشة", "إضافة كليشه", "📝 Add Text"},
@@ -2153,6 +2160,47 @@ async def start_all_userbots():
         tasks.append(task)
     print(f"🚀 Started monitoring {len(tasks)} accounts for {profile_id}")
 
+
+async def start_profile_services(profile_id):
+    """تشغيل فحص العضوية والنشر في الخلفية حتى لا يتأخر رد زر التشغيل."""
+    token = profile_context.set(profile_id)
+    try:
+        join_results = await join_all_accounts_to_configured_groups()
+        if not db.get("is_running"):
+            return
+
+        await start_all_userbots()
+        if not db.get("is_running"):
+            return
+
+        posting_task = asyncio.create_task(auto_posting_loop())
+        profile_posting_tasks[profile_id] = posting_task
+        summary = "\n".join(
+            f"الحساب {item['account']}: {item['joined']}/{item['total']} كروب"
+            for item in join_results
+        )
+        await app.send_message(
+            OWNER_ID,
+            "✅ اكتمل فحص الانضمام وبدأت حلقة النشر.\n"
+            + (summary or "لم توجد حسابات لفحصها.")
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        db["is_running"] = False
+        save_data(db)
+        print(f"❌ فشل تجهيز خدمات المجموعة {profile_id}: {error}")
+        try:
+            await app.send_message(
+                OWNER_ID,
+                f"❌ تعذر تشغيل البوت بعد الضغط على بدء:\n{str(error)[:500]}"
+            )
+        except Exception:
+            pass
+    finally:
+        profile_context.reset(token)
+
+
 # --- ✅ المعالج الأهم والأول: أي رسالة من بوت تحتوي روابط (يعمل إذا كان البوت الرئيسي عضواً) ---
 @app.on_message(
     filters.incoming,
@@ -2283,6 +2331,9 @@ async def handle_owner_commands(client: Client, message: Message):
     if state and navigation_pressed:
         # أي زر من أزرار القائمة يلغي الإدخال الجاري، مثل انتظار رقم الهاتف
         # أو OTP أو كلمة مرور التحقق، ثم يسمح للمعالج بتنفيذ الزر الجديد.
+        qr_session = qr_login_sessions.get(OWNER_ID)
+        if qr_session:
+            qr_session["cancel_event"].set()
         pending_login = login_sessions.pop(OWNER_ID, None)
         if pending_login:
             try:
@@ -2483,6 +2534,12 @@ async def handle_owner_commands(client: Client, message: Message):
             result = await _recover_session_string(session_str, db, user_id_str)
             return await message.reply_text(result)
 
+        elif state == "WAITING_QR":
+            return await message.reply_text(
+                "📷 ما زال تسجيل الدخول عبر QR قيد الانتظار.\n"
+                "امسح الرمز المرسل لك، أو اضغط «إلغاء» لإيقاف العملية."
+            )
+
         elif state == "WAITING_TEMPLATE":
             lines = text.strip().split('\n')
             added_count = 0
@@ -2608,6 +2665,15 @@ async def handle_owner_commands(client: Client, message: Message):
             save_data(db)
             await message.reply_text("📱 أرسل رقم الهاتف مع مفتاح الدولة:\nمثال: +9647800000000")
 
+        elif action == "add_account_qr":
+            if qr_login_sessions.get(OWNER_ID):
+                return await message.reply_text(
+                    "⚠️ توجد عملية QR قيد التشغيل. امسح الرمز الحالي أو ألغِها أولًا."
+                )
+            db["user_state"][user_id_str] = "WAITING_QR"
+            save_data(db)
+            await start_qr_login()
+
         elif action == "recover_account":
             db["user_state"][user_id_str] = "WAITING_RECOVER"
             save_data(db)
@@ -2664,26 +2730,18 @@ async def handle_owner_commands(client: Client, message: Message):
             if not db["accounts"] or not db["templates"] or not db["groups"]:
                 return await message.reply_text("❌ يجب إضافة حساب وكليشة وكروب أولًا.")
 
-            # لا نبدأ الإرسال قبل فحص عضوية كل حساب في كل كروب.
-            join_results = await join_all_accounts_to_configured_groups()
             db["is_running"] = True
             save_data()
-            await start_all_userbots()
-            posting_task = asyncio.create_task(auto_posting_loop())
-            profile_posting_tasks[profile_id] = posting_task
             timer_value = db.get('timer', 60)
+            startup_task = asyncio.create_task(start_profile_services(profile_id))
+            profile_posting_tasks[profile_id] = startup_task
             await message.reply_text(
-                f"🚀 تم تشغيل البوت!\n"
+                f"🚀 تم بدء تشغيل البوت!\n"
                 f"⏱ المؤقت: {timer_value} ثانية\n"
                 f"📊 الحسابات: {len(db['accounts'])}\n"
                 f"📢 الكروبات: {len(db['groups'])}\n"
                 f"📝 الكليشات: {len(db['templates'])}\n"
-                + "🤝 فحص انضمام الحسابات:\n"
-                + "\n".join(
-                    f"الحساب {item['account']}: {item['joined']}/{item['total']} كروب"
-                    for item in join_results
-                )
-                + "\n"
+                "🤝 جارٍ فحص انضمام الحسابات في الخلفية...\n"
                 f"🔄 طابور حسابات متكرر بالترتيب\n"
                 "🎯 إرسال بالتناوب إلى جميع الكروبات المسجلة دون شروط نشاط\n"
                 f"📡 مراقبة الحظر والتجميد مفعلة\n"
@@ -2837,6 +2895,265 @@ def remove_indexed_account_state(state, removed_index, one_based=True):
             updated[str(key_number)] = value
     return updated
 
+
+
+def _qr_login_url(token):
+    encoded_token = base64.urlsafe_b64encode(token).decode("ascii").rstrip("=")
+    return f"tg://login?token={encoded_token}"
+
+
+def _make_qr_image(qr_url):
+    """إنشاء صورة QR في الذاكرة دون كتابة ملفات مؤقتة على الاستضافة."""
+    import qrcode
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(qr_url)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white")
+    photo = io.BytesIO()
+    photo.name = "telegram-login-qr.png"
+    image.save(photo, format="PNG")
+    photo.seek(0)
+    return photo
+
+
+async def _stop_qr_client(client, handler_ref=None):
+    if client is None:
+        return
+    if handler_ref:
+        try:
+            client.remove_handler(*handler_ref)
+        except Exception:
+            pass
+    try:
+        if client.is_initialized:
+            await client.terminate()
+    except Exception:
+        pass
+    try:
+        if client.is_connected:
+            await client.disconnect()
+    except Exception:
+        pass
+
+
+async def _export_qr_login_token(client):
+    return await client.invoke(
+        raw.functions.auth.ExportLoginToken(
+            api_id=API_ID,
+            api_hash=API_HASH,
+            except_ids=[],
+        )
+    )
+
+
+async def _import_migrated_qr_token(client, token_result):
+    """نقل جلسة QR إلى مركز Telegram المطلوب عند اختلاف DC."""
+    dc_option = await client.get_dc_option(
+        token_result.dc_id,
+        ipv6=client.ipv6,
+    )
+    await client.session.stop()
+    client.session = await client.get_session(
+        dc_id=token_result.dc_id,
+        server_address=dc_option.ip_address,
+        port=dc_option.port,
+        export_authorization=False,
+        temporary=True,
+    )
+    await client.storage.dc_id(token_result.dc_id)
+    await client.storage.server_address(dc_option.ip_address)
+    await client.storage.port(dc_option.port)
+    await client.storage.auth_key(client.session.auth_key)
+    return await client.invoke(
+        raw.functions.auth.ImportLoginToken(token=token_result.token)
+    )
+
+
+async def _qr_login_worker():
+    """إظهار QR متجدد وانتظار مسحه ثم حفظ جلسة الحساب."""
+    client = None
+    handler_ref = None
+    qr_message = None
+    session_info = qr_login_sessions.get(OWNER_ID)
+    if not session_info:
+        return
+
+    scan_event = asyncio.Event()
+    cancel_event = session_info["cancel_event"]
+
+    async def on_raw_update(_, update, __, ___):
+        if isinstance(update, raw.types.UpdateLoginToken):
+            scan_event.set()
+
+    try:
+        try:
+            import qrcode  # noqa: F401
+        except ImportError as error:
+            raise RuntimeError(
+                "ميزة QR تحتاج الحزمة qrcode[pil]. أعد نشر التطبيق بعد تحديث requirements.txt."
+            ) from error
+
+        client = Client(
+            f"qr_login_{current_profile_id()}_{OWNER_ID}",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            in_memory=True,
+        )
+        await client.connect()
+        handler_ref = client.add_handler(
+            handlers.RawUpdateHandler(on_raw_update)
+        )
+        await client.initialize()
+
+        expires_at = asyncio.get_running_loop().time() + 180
+        while asyncio.get_running_loop().time() < expires_at:
+            token_result = await _export_qr_login_token(client)
+            if isinstance(token_result, raw.types.auth.LoginTokenMigrateTo):
+                token_result = await _import_migrated_qr_token(client, token_result)
+
+            if not isinstance(token_result, raw.types.auth.LoginToken):
+                raise RuntimeError(
+                    f"Telegram أعاد استجابة QR غير متوقعة: {type(token_result).__name__}"
+                )
+
+            qr_url = _qr_login_url(token_result.token)
+            photo = _make_qr_image(qr_url)
+            if qr_message:
+                try:
+                    await qr_message.delete()
+                except Exception:
+                    pass
+            qr_message = await app.send_photo(
+                OWNER_ID,
+                photo=photo,
+                caption=(
+                    "📷 امسح هذا الرمز من Telegram:\n\n"
+                    "الإعدادات ← الأجهزة ← ربط جهاز سطح المكتب\n\n"
+                    "⏳ الرمز يتجدد تلقائيًا عند انتهاء صلاحيته."
+                ),
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("❌ إلغاء", callback_data="cancel_qr_login")]]
+                ),
+            )
+
+            scan_event.clear()
+            remaining = max(
+                1,
+                min(
+                    int(getattr(token_result, "expires", 0))
+                    - int(datetime.now().timestamp()),
+                    30,
+                ),
+            )
+            scan_wait = asyncio.create_task(scan_event.wait())
+            cancel_wait = asyncio.create_task(cancel_event.wait())
+            done, pending = await asyncio.wait(
+                {scan_wait, cancel_wait},
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+            if cancel_wait in done:
+                await app.send_message(OWNER_ID, "❌ تم إلغاء تسجيل الدخول عبر QR.")
+                return
+            if scan_wait not in done:
+                continue
+
+            result = await _export_qr_login_token(client)
+            if isinstance(result, raw.types.auth.LoginTokenMigrateTo):
+                result = await _import_migrated_qr_token(client, result)
+            if not isinstance(result, raw.types.auth.LoginTokenSuccess):
+                continue
+
+            raw_user = getattr(result.authorization, "user", None)
+            if raw_user is None or not getattr(raw_user, "id", None):
+                raise RuntimeError("تم مسح الرمز لكن Telegram لم يعِد بيانات الحساب.")
+
+            await client.storage.user_id(raw_user.id)
+            await client.storage.is_bot(False)
+            me = await client.get_me()
+            session_string = await client.export_session_string()
+
+            existing_owner = find_account_owner_by_session(session_string)
+            if not existing_owner and me.phone_number:
+                existing_owner = await find_account_owner_by_phone(me.phone_number)
+            if existing_owner:
+                await app.send_message(
+                    OWNER_ID,
+                    duplicate_account_warning(
+                        existing_owner,
+                        me.phone_number or "غير معروف",
+                    ),
+                )
+                return
+
+            new_account_index = len(db["accounts"])
+            db["accounts"].append(session_string)
+            db["user_state"].pop(str(OWNER_ID), None)
+            save_data(db)
+            get_account_cache().clear()
+            joined_count, total_groups = await join_account_to_configured_groups(
+                session_string,
+                new_account_index,
+            )
+            await app.send_message(
+                OWNER_ID,
+                "✅ تمت إضافة الحساب عبر QR بنجاح!\n"
+                f"📱 الرقم: {me.phone_number or 'غير معروف'}\n"
+                f"👤 الاسم: {me.first_name or 'غير معروف'}\n"
+                f"📢 انضم إلى {joined_count} من {total_groups} كروب مسجل.",
+            )
+            return
+
+        await app.send_message(
+            OWNER_ID,
+            "⌛ انتهت مهلة QR. اضغط «📷 إضافة حساب QR» لإصدار رمز جديد.",
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        db["user_state"].pop(str(OWNER_ID), None)
+        save_data(db)
+        print(f"❌ QR login failed: {error}")
+        try:
+            await app.send_message(
+                OWNER_ID,
+                f"❌ فشل تسجيل الدخول عبر QR:\n{str(error)[:500]}",
+            )
+        except Exception:
+            pass
+    finally:
+        if qr_message:
+            try:
+                await qr_message.delete()
+            except Exception:
+                pass
+        await _stop_qr_client(client, handler_ref)
+        qr_login_sessions.pop(OWNER_ID, None)
+        if db.get("user_state", {}).get(str(OWNER_ID)) == "WAITING_QR":
+            db["user_state"].pop(str(OWNER_ID), None)
+            save_data(db)
+
+
+async def start_qr_login():
+    """بدء عملية QR في مهمة مستقلة حتى لا يتجمد معالج رسائل المالك."""
+    if qr_login_sessions.get(OWNER_ID):
+        return
+    cancel_event = asyncio.Event()
+    task = asyncio.create_task(_qr_login_worker())
+    qr_login_sessions[OWNER_ID] = {
+        "task": task,
+        "cancel_event": cancel_event,
+    }
 
 
 def _normalize_session_string(session_str):
@@ -3122,6 +3439,13 @@ async def handle_callback(client: Client, callback_query):
     await callback_query.answer()
     if data == "cancel":
         await callback_query.message.delete()
+        return
+    if data == "cancel_qr_login":
+        session_info = qr_login_sessions.get(OWNER_ID)
+        if session_info:
+            session_info["cancel_event"].set()
+        await callback_query.message.delete()
+        await callback_query.answer("تم إلغاء تسجيل الدخول")
         return
     if data == "incoming_list":
         keyboard = build_incoming_replies_keyboard()
