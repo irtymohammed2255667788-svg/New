@@ -1611,7 +1611,7 @@ async def ensure_account_in_group(client, group, account_number):
         except Exception:
             pass
 
-    chat_target = clean_group
+    chat_target = clean_link
     try:
         member = await client.get_chat_member(chat_target, "me")
         status = getattr(member, "status", "")
