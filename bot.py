@@ -3811,11 +3811,20 @@ if __name__ == "__main__":
             finally:
                 profile_context.reset(token)
 
-    # تشغيل userbots واستئناف حلقة النشر قبل تشغيل البوت الرئيسي
-    asyncio.get_event_loop().run_until_complete(startup_tasks())
+    async def run_background_startup():
+        """تشغيل فحص الحسابات بعد فتح البوت الرئيسي حتى لا يتأخر /start."""
+        try:
+            await startup_tasks()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            # لا نسمح لفشل فحص حساب أو كروب بإيقاف بوت Telegram الرئيسي.
+            print(f"❌ Background startup failed: {error}")
 
-    # تشغيل البوت الرئيسي مع تسجيل هوية البوت المتصل بدل app.run() الصامت.
+    # شغّل البوت الرئيسي أولًا. فحص الانضمام قد يستغرق وقتًا أو يتوقف
+    # مؤقتًا بسبب FLOOD_WAIT، ولا ينبغي أن يمنع استقبال /start والرد عليه.
     async def run_main_bot():
+        startup_task = None
         try:
             await app.start()
             me = await app.get_me()
@@ -3823,8 +3832,12 @@ if __name__ == "__main__":
                 f"✅ Main bot connected: @{me.username or 'no_username'} "
                 f"(ID {me.id})"
             )
+            startup_task = asyncio.create_task(run_background_startup())
             await idle()
         finally:
+            if startup_task and not startup_task.done():
+                startup_task.cancel()
+                await asyncio.gather(startup_task, return_exceptions=True)
             if app.is_connected:
                 await app.stop()
 
