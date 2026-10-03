@@ -3700,11 +3700,21 @@ async def start_cmd(client: Client, message: Message):
         return
     if message.from_user.id != OWNER_ID:
         return await message.reply_text("⛔ هذا البوت مخصص لمالكه فقط.")
-    if db.get("joined_channels"):
-        ensure_auto_leave_task()
-    db["user_state"].pop(str(OWNER_ID), None)
-    save_data(db)
-    await show_profile_menu(message)
+
+    print("[/start] Command received from owner")
+    try:
+        if db.get("joined_channels"):
+            ensure_auto_leave_task()
+        db["user_state"].pop(str(OWNER_ID), None)
+        save_data(db)
+        await show_profile_menu(message)
+        print("[/start] Profile menu sent")
+    except Exception as error:
+        print(f"[/start] Failed with {type(error).__name__}: {error}")
+        try:
+            await message.reply_text("⚠️ تعذر فتح القائمة. راجع سجل تشغيل Railway.")
+        except Exception as reply_error:
+            print(f"[/start] Could not send diagnostic reply: {type(reply_error).__name__}")
 
 # --- Toggle auto join ---
 @app.on_message(filters.private & filters.user(OWNER_ID) & filters.command("toggle_auto_join"))
